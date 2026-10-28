@@ -525,6 +525,12 @@ class TestDatabricksHandle:
         assert handle._safe_execute(f)._cursor == new_cursor
         assert handle._cursor._cursor == new_cursor
 
+    def test_execute__passes_query_tags(self, conn, cursor):
+        conn.cursor.return_value = cursor
+        handle = DatabricksHandle(conn, True)
+        handle.execute("select 1;", None, {"team": "data"})
+        cursor.execute.assert_called_once_with("select 1", None, query_tags={"team": "data"})
+
     def test_cancel__closed(self, conn):
         handle = DatabricksHandle(conn, True)
         handle.open = False

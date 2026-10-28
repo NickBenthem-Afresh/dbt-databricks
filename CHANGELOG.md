@@ -1,3 +1,13 @@
+## dbt-databricks next
+
+### Features
+
+- Add an opt-in `reuse_connections` profile setting that keeps each thread's session open across nodes instead of opening a new one per node. A session is replaced before the next node when it has run no SQL for `connect_max_idle` seconds (default 60), when its last statement failed, or when the next node uses a different `databricks_compute`. Model query tags are set on each statement, so query history stays correct on a reused session
+
+### Under the Hood
+
+- Raise the `databricks-sql-connector` floor to `>=4.2.6` for per-statement query tags
+
 ## dbt-databricks 1.13.0 (Oct 29, 2026)
 
 ### Features

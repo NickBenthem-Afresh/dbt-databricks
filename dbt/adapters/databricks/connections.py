@@ -84,6 +84,8 @@ DATABRICKS_QUERY_COMMENT = f"""
 {{{{ return(tojson(comment_dict)) }}}}
 """
 
+DEFAULT_MAX_IDLE_SECONDS = 60
+
 
 @dataclass(frozen=True)
 class QueryContextWrapper:
@@ -142,6 +144,7 @@ class DatabricksDBTConnection(Connection):
     http_path: str = ""
     thread_identifier: tuple[int, int] = (0, 0)
     session_id: Optional[str] = None
+    last_used_at: float = 0.0
     _query_header_context: Any = None
 
     def __str__(self) -> str:
@@ -243,15 +246,22 @@ class DatabricksConnectionManager(SparkConnectionManager):
     @contextmanager
     def exception_handler(self, sql: str) -> Iterator[None]:
         log_sql = redact_credentials(sql)
+        conn = cast(Optional[DatabricksDBTConnection], self.get_if_exists())
 
         try:
             yield
+            if conn:
+                conn.last_used_at = time.time()
 
         except Error as exc:
+            if conn:
+                conn.last_used_at = 0.0
             logger.debug(QueryError(log_sql, exc))
             raise DbtDatabaseError(str(exc)) from exc
 
         except Exception as exc:
+            if conn:
+                conn.last_used_at = 0.0
             logger.debug(QueryError(log_sql, exc))
             if len(exc.args) == 0:
                 raise
@@ -271,7 +281,10 @@ class DatabricksConnectionManager(SparkConnectionManager):
         wrapped = QueryContextWrapper.from_context(query_header_context)
 
         # Get a connection for this thread
-        conn = self.get_if_exists()
+        conn = cast(Optional[DatabricksDBTConnection], self.get_if_exists())
+
+        if conn and conn.state == "open" and self._should_recycle(conn, wrapped):
+            self.close(conn)
 
         if conn and conn.name == conn_name and conn.state == "open":
             # Found a connection and nothing to do, so just return it
@@ -280,7 +293,10 @@ class DatabricksConnectionManager(SparkConnectionManager):
         if conn is None:
             conn = self._create_fresh_connection(conn_name, wrapped)
         else:  # existing connection either wasn't open or didn't have the right name
+            conn._query_header_context = wrapped
             if conn.state != "open":
+                creds = cast(DatabricksCredentials, self.profile.credentials)
+                conn.http_path = QueryConfigUtils.get_http_path(wrapped, creds)
                 conn.handle = LazyHandle(self.open)
             if conn.name != conn_name:
                 orig_conn_name: str = conn.name or ""
@@ -288,6 +304,21 @@ class DatabricksConnectionManager(SparkConnectionManager):
                 fire_event(ConnectionReused(orig_conn_name=orig_conn_name, conn_name=conn_name))
 
         return conn
+
+    def _should_recycle(self, conn: DatabricksDBTConnection, context: QueryContextWrapper) -> bool:
+        """With reuse_connections, a thread's session outlives its node. Close it before
+        the next node if it has idled past connect_max_idle (warehouses drop idle sessions),
+        if its last statement failed, or if the next node runs on a different compute."""
+        creds = cast(DatabricksCredentials, self.profile.credentials)
+        if not creds.reuse_connections:
+            return False
+        max_idle = creds.connect_max_idle
+        if max_idle is None:
+            max_idle = DEFAULT_MAX_IDLE_SECONDS
+        return (
+            time.time() - conn.last_used_at > max_idle
+            or conn.http_path != QueryConfigUtils.get_http_path(context, creds)
+        )
 
     def _create_fresh_connection(
         self, conn_name: str, query_header_context: QueryContextWrapper
@@ -355,7 +386,7 @@ class DatabricksConnectionManager(SparkConnectionManager):
                 pre = time.time()
 
                 handle: DatabricksHandle = connection.handle
-                cursor = handle.execute(sql, bindings)
+                cursor = handle.execute(sql, bindings, self._statement_query_tags(connection))
                 response = self.get_response(cursor)
                 fire_event(
                     SQLQueryStatus(
@@ -451,8 +482,20 @@ class DatabricksConnectionManager(SparkConnectionManager):
             lambda cursor: cursor.list_tables(database=database, schema=schema),
         )
 
+    def _statement_query_tags(self, connection: Connection) -> Optional[dict[str, str]]:
+        """A reused session carries the query tags of the node that opened it, so tag
+        each statement with the current node's tags instead."""
+        creds = cast(DatabricksCredentials, connection.credentials)
+        if not creds.reuse_connections:
+            return None
+        context = getattr(connection, "_query_header_context", None)
+        return QueryConfigUtils.get_merged_query_tags(context, creds)
+
     # override
     def release(self) -> None:
+        if cast(DatabricksCredentials, self.profile.credentials).reuse_connections:
+            return
+
         with self.lock:
             conn = cast(Optional[DatabricksDBTConnection], self.get_if_exists())
             if conn is None:
@@ -466,9 +509,8 @@ class DatabricksConnectionManager(SparkConnectionManager):
     # override
     def cleanup_all(self) -> None:
         with self.lock:
-            # Close the current thread connection if it exists
-            conn = cast(Optional[DatabricksDBTConnection], self.get_if_exists())
-            if conn:
+            # Other threads' connections are already released unless reuse_connections is on
+            for conn in self.thread_connections.values():
                 fire_event(ConnectionClosedInCleanup(conn_name=cast_to_str(conn.name)))
                 self.close(conn)
 
@@ -500,6 +542,9 @@ class DatabricksConnectionManager(SparkConnectionManager):
 
         # Get merged query tags if we have query header context
         query_header_context = getattr(databricks_connection, "_query_header_context", None)
+        if creds.reuse_connections:
+            # The session outlives this node, so model tags go on each statement instead.
+            query_header_context = QueryContextWrapper()
         merged_query_tags = {}
         if query_header_context:
             merged_query_tags = QueryConfigUtils.get_merged_query_tags(query_header_context, creds)
@@ -517,6 +562,7 @@ class DatabricksConnectionManager(SparkConnectionManager):
                 )
                 if conn:
                     databricks_connection.session_id = conn.session_id
+                    databricks_connection.last_used_at = time.time()
                     cls._cache_dbr_capabilities(creds, databricks_connection.http_path)
                     databricks_connection.capabilities = cls._get_capabilities_for_http_path(
                         databricks_connection.http_path

@@ -1,16 +1,22 @@
 import threading
+import time
 from multiprocessing import get_context
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from databricks.sql.exc import Error
+from dbt.adapters.contracts.connection import ConnectionState, Identifier, LazyHandle
+from dbt_common.exceptions import DbtDatabaseError
 
 from dbt.adapters.databricks.connections import (
     DatabricksConnectionManager,
     DatabricksDBTConnection,
+    QueryContextWrapper,
 )
 from dbt.adapters.databricks.credentials import DatabricksCredentials
 from dbt.adapters.databricks.dbr_capabilities import DBRCapabilities, DBRCapability
-from dbt.adapters.databricks.utils import is_cluster_http_path
+from dbt.adapters.databricks.utils import QueryTagsUtils, is_cluster_http_path
 
 
 class TestDatabricksConnectionManager:
@@ -215,7 +221,9 @@ class TestOpenSpogIntegration:
 
 class TestRelease:
     def test_release_does_not_hold_lock_while_closing(self):
-        connection_manager = DatabricksConnectionManager(Mock(), get_context("spawn"))
+        profile = Mock()
+        profile.credentials.reuse_connections = False
+        connection_manager = DatabricksConnectionManager(profile, get_context("spawn"))
         conn = Mock(spec=DatabricksDBTConnection)
         connection_manager.set_thread_connection(conn)
         other_thread_got_lock = []
@@ -249,3 +257,160 @@ class TestRelease:
             connection_manager.release()
 
         mock_close.assert_not_called()
+
+
+class TestReuseConnections:
+    DEFAULT_PATH = "sql/1.0/warehouses/default"
+    ALT_PATH = "sql/1.0/warehouses/alt"
+
+    def manager(self, reuse_connections=True, connect_max_idle=None):
+        profile = Mock()
+        profile.credentials = Mock(spec=DatabricksCredentials)
+        profile.credentials.reuse_connections = reuse_connections
+        profile.credentials.connect_max_idle = connect_max_idle
+        profile.credentials.http_path = self.DEFAULT_PATH
+        profile.credentials.compute = {"alt": {"http_path": self.ALT_PATH}}
+        profile.credentials.query_tags = None
+        return DatabricksConnectionManager(profile, get_context("spawn"))
+
+    def open_connection(self, connection_manager, last_used_at):
+        conn = DatabricksDBTConnection(
+            type=Identifier("databricks"),
+            name="model.a",
+            state=ConnectionState.OPEN,
+            transaction_open=False,
+            handle=Mock(),
+            credentials=connection_manager.profile.credentials,
+        )
+        conn.http_path = self.DEFAULT_PATH
+        conn.last_used_at = last_used_at
+        connection_manager.set_thread_connection(conn)
+        return conn
+
+    def node(self, name, compute=None):
+        config = Mock()
+        config.get.return_value = compute
+        config.extra = {}
+        config.materialized = "table"
+        return SimpleNamespace(name=name, relation_name=name, config=config)
+
+    @pytest.fixture
+    def mock_close(self):
+        def close(conn):
+            conn.state = ConnectionState.CLOSED
+
+        with patch.object(DatabricksConnectionManager, "close", side_effect=close) as mock:
+            yield mock
+
+    def test_release_keeps_session(self, mock_close):
+        connection_manager = self.manager()
+        conn = self.open_connection(connection_manager, time.time())
+
+        connection_manager.release()
+
+        mock_close.assert_not_called()
+        assert connection_manager.get_if_exists() is conn
+
+    def test_next_node_reuses_session(self, mock_close):
+        connection_manager = self.manager()
+        conn = self.open_connection(connection_manager, time.time())
+
+        result = connection_manager.set_connection_name("model.b", self.node("b"))
+
+        mock_close.assert_not_called()
+        assert result is conn
+        assert conn.state == ConnectionState.OPEN
+        assert conn._query_header_context.model_name == "b"
+
+    def test_idle_session_is_recycled(self, mock_close):
+        connection_manager = self.manager(connect_max_idle=30)
+        conn = self.open_connection(connection_manager, time.time() - 31)
+
+        connection_manager.set_connection_name("model.b", self.node("b"))
+
+        mock_close.assert_called_once_with(conn)
+        assert isinstance(conn._handle, LazyHandle)
+
+    def test_session_is_recycled_after_failed_statement(self, mock_close):
+        connection_manager = self.manager()
+        conn = self.open_connection(connection_manager, time.time())
+
+        with pytest.raises(DbtDatabaseError):
+            with connection_manager.exception_handler("select 1"):
+                raise Error("session expired")
+        connection_manager.set_connection_name("model.b", self.node("b"))
+
+        mock_close.assert_called_once_with(conn)
+
+    def test_session_is_recycled_on_compute_change(self, mock_close):
+        connection_manager = self.manager()
+        conn = self.open_connection(connection_manager, time.time())
+
+        connection_manager.set_connection_name("model.b", self.node("b", compute="alt"))
+
+        mock_close.assert_called_once_with(conn)
+        assert conn.http_path == self.ALT_PATH
+
+    def test_idle_session_is_not_recycled_without_reuse(self, mock_close):
+        connection_manager = self.manager(reuse_connections=False)
+        self.open_connection(connection_manager, 0.0)
+
+        connection_manager.set_connection_name("model.b", self.node("b"))
+
+        mock_close.assert_not_called()
+
+    @pytest.mark.parametrize("reuse_connections", [True, False])
+    def test_add_query_tags_statements_only_with_reuse(self, reuse_connections):
+        connection_manager = self.manager(reuse_connections=reuse_connections)
+        conn = self.open_connection(connection_manager, time.time())
+        connection_manager.set_connection_name("model.b", self.node("b"))
+
+        with patch.object(
+            DatabricksConnectionManager, "get_response", return_value=Mock(query_id="q")
+        ):
+            connection_manager.add_query("select 1")
+
+        query_tags = conn.handle.execute.call_args.args[2]
+        if reuse_connections:
+            assert query_tags[QueryTagsUtils.DBT_MODEL_NAME_QUERY_TAG_KEY] == "b"
+        else:
+            assert query_tags is None
+
+    def test_open_leaves_model_tags_off_the_session(self):
+        connection_manager = self.manager()
+        creds = connection_manager.profile.credentials
+        creds.host = "example.cloud.databricks.com"
+        creds.connect_timeout = None
+        creds.connect_retries = 1
+        creds.retry_all = False
+        creds.cluster_id = None
+        creds.authenticate = Mock(return_value=Mock())
+        conn = self.open_connection(connection_manager, 0.0)
+        conn.state = ConnectionState.INIT
+        conn._query_header_context = QueryContextWrapper.from_context(self.node("a"))
+
+        with (
+            patch("dbt.adapters.databricks.connections.check_spog_preconditions"),
+            patch("dbt.adapters.databricks.connections.DatabricksHandle.from_connection_args"),
+            patch(
+                "dbt.adapters.databricks.connections.SqlUtils.prepare_connection_arguments",
+                return_value={},
+            ) as mock_prepare,
+        ):
+            DatabricksConnectionManager.open(conn)
+
+        session_tags = mock_prepare.call_args.args[3]
+        assert QueryTagsUtils.DBT_MODEL_NAME_QUERY_TAG_KEY not in session_tags
+        assert QueryTagsUtils.DBT_MATERIALIZED_QUERY_TAG_KEY not in session_tags
+
+    def test_cleanup_all_closes_every_thread(self):
+        connection_manager = self.manager()
+        conns = [Mock(spec=DatabricksDBTConnection), Mock(spec=DatabricksDBTConnection)]
+        conns[0].name, conns[1].name = "model.a", "model.b"
+        connection_manager.thread_connections.update({(0, 1): conns[0], (0, 2): conns[1]})
+
+        with patch.object(DatabricksConnectionManager, "close") as mock_close:
+            connection_manager.cleanup_all()
+
+        assert [c.args[0] for c in mock_close.call_args_list] == conns
+        assert connection_manager.thread_connections == {}

@@ -66,6 +66,7 @@ class DatabricksCredentials(Credentials):
     connect_timeout: Optional[int] = None
     retry_all: bool = False
     connect_max_idle: Optional[int] = None
+    reuse_connections: bool = False
     _credentials_manager: Optional["DatabricksCredentialManager"] = None
 
     _ALIASES = {

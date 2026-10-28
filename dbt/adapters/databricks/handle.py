@@ -223,13 +223,20 @@ class DatabricksHandle:
     def connector_connection(self) -> Connection:
         return self._conn
 
-    def execute(self, sql: str, bindings: Optional[Sequence[Any]] = None) -> CursorWrapper:
+    def execute(
+        self,
+        sql: str,
+        bindings: Optional[Sequence[Any]] = None,
+        query_tags: Optional[dict[str, str]] = None,
+    ) -> CursorWrapper:
         """
         Execute a SQL statement on the current session with optional bindings.
         """
         return self._safe_execute(
             lambda cursor: cursor.execute(
-                SqlUtils.clean_sql(sql), SqlUtils.translate_bindings(bindings)
+                SqlUtils.clean_sql(sql),
+                SqlUtils.translate_bindings(bindings),
+                query_tags=query_tags,
             )
         )
 
